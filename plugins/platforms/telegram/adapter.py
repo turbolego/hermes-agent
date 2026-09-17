@@ -282,6 +282,39 @@ def _strip_mdv2(text: str) -> str:
     return cleaned
 
 
+def markdown_to_telegram_html(text: str) -> str:
+    """Convert standard Markdown formatting to Telegram-compatible HTML.
+
+    Escapes raw HTML entities, then converts standard Markdown constructs to
+    Telegram HTML tags. Use this for ``parse_mode=ParseMode.HTML`` sends.
+    """
+    # 1) Escape HTML entities first (covers &, <, >, " across all formatting)
+    text = _html.escape(text)
+    # 2) Fenced code blocks: preserve as <code> spans (no Telegram HTML fence)
+    text = re.sub(r'(```[^\n]*\n[\s\S]*?```)', r'<code>\g<1>[CODE_BLOCK]</code>', text)
+    # 3) Inline code
+    text = re.sub(r'`([^`]+)`', r'<code>\1</code>', text)
+    # 4) Bold
+    text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
+    # 5) Italic
+    text = re.sub(r'\*(.+?)\*', r'<i>\1</i>', text)
+    # 6) Strikethrough
+    text = re.sub(r'~~(.+?)~~', r'<s>\1</s>', text)
+    # 7) Spoiler
+    text = re.sub(r'\|\|(.+?)\|\|', r'<span class="tg-spoiler">\1</span>', text)
+    # 8) Headers → bold
+    text = re.sub(r'^#{1,6}\s+(.+)$', r'<b>\1</b>', text, flags=re.MULTILINE)
+    # 9) Blockquotes
+    text = re.sub(r'^((?:\*\*)?>{1,3})\s+(.+)$', r'<blockquote>\2</blockquote>', text, flags=re.MULTILINE)
+    # 10) Links
+    text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2">\1</a>', text)
+    # 11) Unordered lists
+    text = re.sub(r'^(\s*)[-*]\s+', r'\1• ', text, flags=re.MULTILINE)
+    # 12) Ordered lists
+    text = re.sub(r'^(\s*)\d+\.\s+', r'\1', text, flags=re.MULTILINE)
+    return text
+
+
 _CHUNK_INDICATOR_ON_FENCE_RE = re.compile(r'(?m)^``` (?P<indicator>(?:\\)?\(\d+/\d+(?:\\)?\))$')
 
 
@@ -3267,12 +3300,13 @@ class TelegramAdapter(BasePlatformAdapter):
         return _NetErr, _BadReq, _TimedOut
 
     async def _send_chunk_markdown_or_plain(self, chunk: str, send_kwargs: Dict[str, Any]):
-        """MarkdownV2 first; on a parse/markdown rejection resend as stripped plain text."""
+        """HTML first; on a parse/markdown rejection resend as stripped plain text."""
         try:
-            return await self._bot.send_message(text=chunk, parse_mode=ParseMode.MARKDOWN_V2, **send_kwargs)
-        except Exception as md_error:
-            if "parse" in str(md_error).lower() or "markdown" in str(md_error).lower():
-                logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
+            html_chunk = self.format_message_html(chunk)
+            return await self._bot.send_message(text=html_chunk, parse_mode=ParseMode.HTML, **send_kwargs)
+        except Exception as html_error:
+            if "parse" in str(html_error).lower() or "markdown" in str(html_error).lower() or "html" in str(html_error).lower():
+                logger.warning("[%s] HTML parse failed, falling back to plain text: %s", self.name, html_error)
                 return await self._bot.send_message(text=_strip_mdv2(chunk), parse_mode=None, **send_kwargs)
             raise
 
@@ -3410,7 +3444,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=None)
         error_types = self._telegram_error_types()
         try:
-            # Bot API 10.1 rich fast-path; falls through to legacy MarkdownV2 on permanent/capability
+            # Bot API 10.1 rich fast-path; falls through to HTML on permanent/capability
             # errors or DM-topic skips; returns directly on success or transient failure (no legacy resend).
             if self._should_attempt_rich(content, metadata=metadata):
                 rich_result = await self._try_send_rich(chat_id, content, reply_to, metadata)
@@ -3418,13 +3452,11 @@ class TelegramAdapter(BasePlatformAdapter):
                     if rich_result.success:
                         await self._retrigger_typing(chat_id, metadata)
                     return rich_result
-            chunks = self.truncate_message(self.format_message(content), self.MAX_MESSAGE_LENGTH, len_fn=utf16_len)
+            html_text = self.format_message_html(content)
+            chunks = self.truncate_message(html_text, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len)
             if len(chunks) > 1:
-                # truncate_message appends a raw " (1/2)" suffix; escape the MarkdownV2-special parentheses.
-                chunks = [
-                    _separate_chunk_indicator_from_fence(re.sub(r" \((\d+)/(\d+)\)$", r" \\(\1/\2\\)", chunk))
-                    for chunk in chunks
-               ]
+                # In HTML mode the chunk indicator is plain text (no MarkdownV2 fence needed).
+                pass
             message_ids = []
             thread_id = self._metadata_thread_id(metadata)
             requested_thread_id = self._message_thread_id_for_send(thread_id)
@@ -3490,10 +3522,10 @@ class TelegramAdapter(BasePlatformAdapter):
         await self._bot.edit_message_text(**kwargs)
 
     async def _edit_markdown_or_plain(self, chat_id: str, message_id: str, formatted: str, plain: str, warn_fmt: str) -> bool:
-        """MarkdownV2 edit with plain-text fallback. Returns True on a "not modified" no-op (caller may
+        """HTML edit with plain-text fallback. Returns True on a "not modified" no-op (caller may
         skip further work); the fallback edit's exceptions propagate."""
         try:
-            await self._edit_text(chat_id, message_id, formatted, ParseMode.MARKDOWN_V2)
+            await self._edit_text(chat_id, message_id, self.format_message_html(formatted), ParseMode.HTML)
         except Exception as fmt_err:
             if "not modified" in str(fmt_err).lower():
                 return True
@@ -3623,18 +3655,18 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _send_overflow_continuation(
         self, chat_id: str, chunk: str, reply_to_id: Optional[int], thread_kwargs: Dict[str, Any],
         thread_id: Optional[str], metadata: Optional[Dict[str, Any]], finalize: bool):
-        """Send one continuation chunk (MarkdownV2 then plain on finalize; raw when streaming); drops the
+        """Send one continuation chunk (HTML then plain on finalize; raw when streaming); drops the
         reply anchor once on 'reply message not found'. Returns the sent message or None."""
         base = {**self._link_preview_kwargs(), **self._notification_kwargs(metadata)}
-        for use_markdown in (True, False) if finalize else (False,):
+        for use_html in (True, False) if finalize else (False,):
             try:
-                if use_markdown:
-                    text = _separate_chunk_indicator_from_fence(self.format_message(chunk))
+                if use_html:
+                    text = self.format_message_html(chunk)
                 else:
                     # Degrade to stripped text on finalize (raw ** / ``` would render literally); previews stay raw.
                     text = _strip_mdv2(chunk) if finalize else chunk
                 return await self._bot.send_message(
-                    chat_id=normalize_telegram_chat_id(chat_id), text=text, parse_mode=ParseMode.MARKDOWN_V2 if use_markdown else None,
+                    chat_id=normalize_telegram_chat_id(chat_id), text=text, parse_mode=ParseMode.HTML if use_html else None,
                     reply_to_message_id=reply_to_id, **thread_kwargs, **base)
             except Exception as send_err:
                 if "reply message not found" in str(send_err).lower():
@@ -3650,7 +3682,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         logger.warning(
                             "[%s] Overflow continuation no-reply retry failed: %s", self.name, _redact_telegram_error_text(_retry_err))
                         return None
-                if use_markdown:
+                if use_html:
                     continue  # try plain text on next loop iteration
                 logger.warning("[%s] Overflow continuation send failed: %s", self.name, _redact_telegram_error_text(send_err))
                 return None
@@ -3747,23 +3779,23 @@ class TelegramAdapter(BasePlatformAdapter):
             getattr(self, "_rich_messages_enabled", False) and not getattr(self, "_rich_drafts_enabled", False)
             and self._needs_rich_rendering(text))
         draft_thread_kwargs = self._thread_kwargs_for_draft(chat_id, metadata)
-        for use_markdown in ((False,) if plain_rich_preview else (True, False)):
+        for use_html in ((False,) if plain_rich_preview else (True, False)):
             kwargs: Dict[str, Any] = {
                 "chat_id": normalize_telegram_chat_id(chat_id), "draft_id": int(draft_id),
-                "text": self.format_message(text) if use_markdown else text}
-            if use_markdown:
-                kwargs["parse_mode"] = ParseMode.MARKDOWN_V2
+                "text": self.format_message_html(text) if use_html else text}
+            if use_html:
+                kwargs["parse_mode"] = ParseMode.HTML
             kwargs.update(draft_thread_kwargs)
             try:
                 if await self._bot.send_message_draft(**kwargs):
                     return SendResult(success=True, message_id=None)
                 return SendResult(success=False, error="draft_rejected")
             except Exception as e:
-                # MarkdownV2 parse failure → retry once as plain text; anything else returns to the caller,
+                # HTML parse failure → retry once as plain text; anything else returns to the caller,
                 # which falls back to edit-based streaming for this response.
-                if use_markdown and self._is_bad_request_error(e):
+                if use_html and self._is_bad_request_error(e):
                     logger.debug(
-                        "[%s] sendMessageDraft MarkdownV2 rejected, retrying as plain text (chat=%s draft_id=%s): %s",
+                        "[%s] sendMessageDraft HTML rejected, retrying as plain text (chat=%s draft_id=%s): %s",
                         self.name, chat_id, draft_id, _redact_telegram_error_text(e))
                     continue
                 logger.debug("[%s] sendMessageDraft failed (chat=%s draft_id=%s): %s", self.name, chat_id, draft_id, e)
@@ -3820,7 +3852,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 return built
             text, keyboard, on_sent = built
             msg = await self._send_control_message(
-                chat_id, text, parse_mode=parse_mode if parse_mode is not None else ParseMode.MARKDOWN_V2,
+                chat_id, text, parse_mode=parse_mode if parse_mode is not None else ParseMode.HTML,
                 reply_markup=keyboard, thread_id=thread_id, metadata=metadata, reply_to_mode=reply_to_mode)
             if on_sent is not None:
                 on_sent(msg)
@@ -3839,7 +3871,7 @@ class TelegramAdapter(BasePlatformAdapter):
         """Send an inline-keyboard Yes/No prompt for the gateway ``/update`` watcher."""
         def build():
             default_hint = f" (default: {default})" if default else ""
-            text = self.format_message(f"☤ *Update needs your input:*\n\n{prompt}{default_hint}")
+            text = self.format_message_html(f"☤ *Update needs your input:*\n\n{prompt}{default_hint}")
             keyboard = InlineKeyboardMarkup([[
                 InlineKeyboardButton("✓ Yes", callback_data="update_prompt:y"),
                 InlineKeyboardButton("✗ No", callback_data="update_prompt:n")]])
@@ -3887,7 +3919,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     InlineKeyboardButton("🔒 Always Approve", callback_data=f"sc:always:{confirm_id}")],
                 [InlineKeyboardButton("❌ Cancel", callback_data=f"sc:cancel:{confirm_id}")],
            ])
-            preview = self.format_message(self._truncate_preview(message, 3800))
+            preview = self.format_message_html(self._truncate_preview(message, 3800))
             return preview, keyboard, lambda msg: self._slash_confirm_state.__setitem__(confirm_id, session_key)
         return await self._send_prompt(
             "send_slash_confirm", chat_id, metadata, build, thread_id=self._metadata_thread_id(metadata), reply_to_mode=self._reply_to_mode)
@@ -3926,7 +3958,7 @@ class TelegramAdapter(BasePlatformAdapter):
         """Send an inline-keyboard model picker: provider → model drill-down, edited in place."""
         def build():
             keyboard, provider_page_info = self._build_provider_keyboard(providers, 0)
-            text = self.format_message(
+            text = self.format_message_html(
                 self._provider_list_text(current_model, self._provider_get_label()(current_provider), provider_page_info)
             )
 
@@ -3960,15 +3992,15 @@ class TelegramAdapter(BasePlatformAdapter):
             def _remember(msg):
                 self._choice_picker_state[str(chat_id)] = {
                     "msg_id": msg.message_id, "choices": choices, "session_key": session_key, "on_choice_selected": on_choice_selected}
-            return self.format_message(title), keyboard, _remember
+            return self.format_message_html(title), keyboard, _remember
         return await self._send_prompt(
             "send_choice_picker", chat_id, metadata, build, thread_id=metadata.get("thread_id") if metadata else None,
             reply_to_mode=self._reply_to_mode)
 
     async def _edit_result_text(self, query, result_text: str) -> None:
-        """Replace a picker message with ``result_text`` (MarkdownV2, then plain, then give up), keyboard removed."""
+        """Replace a picker message with ``result_text`` (HTML, then plain, then give up), keyboard removed."""
         try:
-            await query.edit_message_text(text=self.format_message(result_text), parse_mode=ParseMode.MARKDOWN_V2, reply_markup=None)
+            await query.edit_message_text(text=self.format_message_html(result_text), parse_mode=ParseMode.HTML, reply_markup=None)
         except Exception:
             with contextlib.suppress(Exception):
                 await query.edit_message_text(text=result_text, parse_mode=None, reply_markup=None)
@@ -4072,8 +4104,8 @@ class TelegramAdapter(BasePlatformAdapter):
         return self._paged_keyboard(buttons, page_meta, "mg", self._picker_back_cancel_row())
 
     async def _picker_edit(self, query, text_md: str, keyboard) -> None:
-        """Re-render the picker message in place (MarkdownV2) and ack the tap."""
-        await query.edit_message_text(text=self.format_message(text_md), parse_mode=ParseMode.MARKDOWN_V2, reply_markup=keyboard)
+        """Re-render the picker message in place (HTML) and ack the tap."""
+        await query.edit_message_text(text=self.format_message_html(text_md), parse_mode=ParseMode.HTML, reply_markup=keyboard)
         await query.answer()
 
     async def _picker_show_models(self, query, state: dict, page: int) -> None:
@@ -4187,8 +4219,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 keyboard = InlineKeyboardMarkup([
                     [InlineKeyboardButton("Switch anyway", callback_data=f"mc:{idx}")], self._picker_back_cancel_row()])
                 await query.edit_message_text(
-                    text=self.format_message(f"⚠ *{warning.title}*\n\n{warning.message}"),
-                    parse_mode=ParseMode.MARKDOWN_V2, reply_markup=keyboard)
+                    text=self.format_message_html(f"⚠ *{warning.title}*\n\n{warning.message}"),
+                    parse_mode=ParseMode.HTML, reply_markup=keyboard)
                 await query.answer(text="Confirm model selection")
                 return
             await self._picker_switch(query, chat_id, model_id, provider_slug, callback)
@@ -4402,8 +4434,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 chat_type = getattr(getattr(query.message, "chat", None), "type", None)
                 prompt_message_id = getattr(query.message, "message_id", None)
                 send_kwargs: Dict[str, Any] = {
-                    "chat_id": int(query.message.chat_id), "text": self.format_message(result_text),
-                    "parse_mode": ParseMode.MARKDOWN_V2, **self._link_preview_kwargs()}
+                    "chat_id": int(query.message.chat_id), "text": self.format_message_html(result_text),
+                    "parse_mode": ParseMode.HTML, **self._link_preview_kwargs()}
                 is_private_chat = str(getattr(chat_type, "value", chat_type)).lower() in {
                     "private", str(ChatType.PRIVATE).lower(), str(getattr(ChatType.PRIVATE, "value", ChatType.PRIVATE)).lower()}
                 if thread_id is not None:
@@ -4751,12 +4783,12 @@ class TelegramAdapter(BasePlatformAdapter):
         _caption_variants: List[tuple] = []
         if caption:
             try:
-                _formatted_caption = self.format_message(caption)
+                _formatted_caption = self.format_message_html(caption)
                 if utf16_len(_formatted_caption) <= 1024:
-                    _caption_variants.append((_formatted_caption, ParseMode.MARKDOWN_V2))
+                    _caption_variants.append((_formatted_caption, ParseMode.HTML))
             except Exception:
-                logger.debug("[%s] voice caption MarkdownV2 formatting failed; sending plain caption", self.name, exc_info=True)
-            _caption_variants.append((caption[:1024], None))
+                logger.debug("[%s] voice caption HTML formatting failed; sending plain caption", self.name, exc_info=True)
+            _caption_variants.append((_html.escape(caption[:1024]), None))
         else:
             _caption_variants.append((None, None))
         _last_parse_error: Optional[Exception] = None
@@ -5209,6 +5241,15 @@ class TelegramAdapter(BasePlatformAdapter):
                     elif seg[j] == ')':
                         depth += 1
         return '\\' + ch
+
+    def format_message_html(self, content: str) -> str:
+        """Convert standard markdown to Telegram HTML format.
+
+        First calls ``format_message`` to get MarkdownV2-formatted text, then converts to
+        Telegram-compatible HTML. This is the formatting path for ``parse_mode=ParseMode.HTML``.
+        """
+        mdv2 = self.format_message(content)
+        return markdown_to_telegram_html(mdv2)
 
     # ── Group mention gating ──────────────────────────────────────────────
 

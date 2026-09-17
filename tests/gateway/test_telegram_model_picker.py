@@ -40,9 +40,9 @@ class TestTelegramModelPicker:
         )
 
         assert result.success is True
-        assert "MARKDOWN_V2" in repr(sent["parse_mode"])
+        assert "HTML" in repr(sent["parse_mode"])
+        assert "model_1" in sent["text"]
         assert "provider\\_one" in sent["text"]
-        assert "`model_1`" in sent["text"]
 
     @pytest.mark.asyncio
     async def test_back_button_escapes_dynamic_provider_label(self):
@@ -67,8 +67,8 @@ class TestTelegramModelPicker:
         await adapter._handle_model_picker_callback(query, "mb", "12345")
 
         edit_kwargs = query.edit_message_text.call_args[1]
-        assert "MARKDOWN_V2" in repr(edit_kwargs["parse_mode"])
+        assert "HTML" in repr(edit_kwargs["parse_mode"])
         assert "provider\\_one" in edit_kwargs["text"]
-        assert "`model_1`" in edit_kwargs["text"]
+        assert "<code>model_1</code>" in edit_kwargs["text"]
 
 

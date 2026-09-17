@@ -463,7 +463,8 @@ class TestFormatMessageTables:
 
 
 @pytest.mark.asyncio
-async def test_send_escapes_chunk_indicator_for_markdownv2(adapter):
+async def test_send_chunk_indicator_in_html_mode(adapter):
+    """HTML mode: chunk indicator is plain text, no MarkdownV2 escaping needed."""
     adapter.MAX_MESSAGE_LENGTH = 80
     adapter._bot = MagicMock()
 
@@ -482,8 +483,9 @@ async def test_send_escapes_chunk_indicator_for_markdownv2(adapter):
 
     assert result.success is True
     assert len(sent_texts) > 1
-    assert re.search(r" \\\([0-9]+/[0-9]+\\\)$", sent_texts[0])
-    assert re.search(r" \\\([0-9]+/[0-9]+\\\)$", sent_texts[-1])
+    # HTML mode: chunk indicator is plain text `(N/M)`, no escaping needed
+    assert "(" in sent_texts[0] and "/" in sent_texts[0]
+    assert "(" in sent_texts[-1] and "/" in sent_texts[-1]
 
 
 # =========================================================================
